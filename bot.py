@@ -136,6 +136,15 @@ def init_database():
     ''')
 
     cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_reply_templates (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            template TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cur.execute('''
         CREATE TABLE IF NOT EXISTS permissions (
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
@@ -385,6 +394,41 @@ class Database:
         return deleted
 
     @staticmethod
+    def add_reply_template(user_id: int, template: str) -> int:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO user_reply_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return result['id']
+
+    @staticmethod
+    def get_reply_templates(user_id: int) -> List[dict]:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_reply_templates WHERE user_id = %s ORDER BY id', (user_id,))
+        templates = cur.fetchall()
+        cur.close()
+        conn.close()
+        return templates
+
+    @staticmethod
+    def remove_reply_template(user_id: int, template_id: int = None) -> int:
+        conn = get_db()
+        cur = conn.cursor()
+        if template_id:
+            cur.execute('DELETE FROM user_reply_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
+        else:
+            cur.execute('DELETE FROM user_reply_templates WHERE user_id = %s', (user_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
+
+    @staticmethod
     def grant_permission(user_id: int, permission: str, granted_by: int) -> bool:
         conn = get_db()
         cur = conn.cursor()
@@ -518,6 +562,14 @@ class ChildBot:
                 return [t['template'] for t in templates]
         return DEFAULT_SPAM_MESSAGES
 
+    def get_reply_messages(self):
+        bot = Database.get_bot(self.bot_id)
+        if bot:
+            templates = Database.get_reply_templates(bot['user_id'])
+            if templates:
+                return [t['template'] for t in templates]
+        return DEFAULT_REPLY_MESSAGES
+
     async def nc_loop(self, chat_id, target, context, worker_id=1):
         idx = 0
         msgs = self.get_nc_messages()
@@ -599,9 +651,10 @@ class ChildBot:
                     async with self.get_lock(chat_id):
                         msgs = self.pending_replies[chat_id].copy()
                         self.pending_replies[chat_id] = []
+                    msgs_list = self.get_reply_messages()
                     for msg_id in msgs:
                         try:
-                            reply = random.choice(DEFAULT_REPLY_MESSAGES).format(target=target)
+                            reply = random.choice(msgs_list).format(target=target)
                             await context.bot.send_message(chat_id=chat_id, text=reply, reply_to_message_id=msg_id)
                             count += 1
                             self.stats["sent"] += 1
@@ -1295,6 +1348,11 @@ Use `{target}` as placeholder
             await update.message.reply_text("❌ Session expired. Please start again with /addbot")
             return ConversationHandler.END
 
+        user_bots = Database.get_user_bots(owner_id)
+        if len(user_bots) >= 30:
+            await update.message.reply_text("❌ **Bot Limit Reached!**\n\nYou can only add maximum **30 bots** per account.\n\nPlease remove a bot first using /removebot <bot_id>")
+            return ConversationHandler.END
+
         bot_id = Database.add_bot(owner_id, token, bot_username, bot_name)
         if bot_id:
             await update.message.reply_text(
@@ -1525,6 +1583,45 @@ Use `{target}` as placeholder
             except ValueError:
                 await update.message.reply_text("Invalid ID!")
 
+    async def cmd_addreply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not context.args:
+            await update.message.reply_text("Usage: /addreply <template>\nUse {target} as placeholder.")
+            return
+        template = " ".join(context.args)
+        tid = Database.add_reply_template(user_id, template)
+        await update.message.reply_text(f"✅ Reply template #{tid} added!")
+
+    async def cmd_listreply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        templates = Database.get_reply_templates(user_id)
+        if not templates:
+            await update.message.reply_text("📭 No reply templates. Default ones will be used.")
+            return
+        text = "💬 **Your Reply Templates:**\n\n"
+        for t in templates:
+            text += f"**#{t['id']}:** {t['template'][:50]}...\n"
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    async def cmd_removereply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not context.args:
+            await update.message.reply_text("Usage: /removereply <id/all>")
+            return
+        arg = context.args[0].lower()
+        if arg == "all":
+            count = Database.remove_reply_template(user_id)
+            await update.message.reply_text(f"✅ Removed {count} reply templates!")
+        else:
+            try:
+                tid = int(arg)
+                if Database.remove_reply_template(user_id, tid):
+                    await update.message.reply_text(f"✅ Reply template #{tid} removed!")
+                else:
+                    await update.message.reply_text("❌ Template not found!")
+            except ValueError:
+                await update.message.reply_text("Invalid ID!")
+
     async def cmd_adduser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if len(context.args) < 2:
@@ -1600,6 +1697,7 @@ Use `{target}` as placeholder
 
 📝 NC Templates: {len(Database.get_nc_templates(user_id))}
 📝 Spam Templates: {len(Database.get_spam_templates(user_id))}
+💬 Reply Templates: {len(Database.get_reply_templates(user_id))}
 """
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -1609,8 +1707,14 @@ Use `{target}` as placeholder
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("addbot", self.cmd_addbot)],
             states={
-                WAITING_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_token)],
-                WAITING_OWNER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_owner_id)],
+                WAITING_TOKEN: [
+                    CommandHandler("cancel", self.cmd_cancel),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_token)
+                ],
+                WAITING_OWNER_ID: [
+                    CommandHandler("cancel", self.cmd_cancel),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_owner_id)
+                ],
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
         )
@@ -1632,6 +1736,9 @@ Use `{target}` as placeholder
         app.add_handler(CommandHandler("addspam", self.cmd_addspam))
         app.add_handler(CommandHandler("listspam", self.cmd_listspam))
         app.add_handler(CommandHandler("removespam", self.cmd_removespam))
+        app.add_handler(CommandHandler("addreply", self.cmd_addreply))
+        app.add_handler(CommandHandler("listreply", self.cmd_listreply))
+        app.add_handler(CommandHandler("removereply", self.cmd_removereply))
         app.add_handler(CommandHandler("adduser", self.cmd_adduser))
         app.add_handler(CommandHandler("removeuser", self.cmd_removeuser))
         app.add_handler(CommandHandler("listusers", self.cmd_listusers))
