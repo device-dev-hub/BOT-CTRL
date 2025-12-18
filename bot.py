@@ -154,7 +154,7 @@ class Database:
             if bot.get('token') == token:
                 return None
         bot_id = max([int(k) for k in bots.keys()] + [0]) + 1
-        bots[str(bot_id)] = {'id': bot_id, 'user_id': user_id, 'token': token, 'bot_username': username, 'bot_name': name, 'is_running': False}
+        bots[str(bot_id)] = {'id': bot_id, 'user_id': user_id, 'token': token, 'bot_username': username, 'bot_name': name, 'is_running': False, 'created_at': datetime.now().isoformat()}
         save_json("bots.json", bots)
         return bot_id
 
@@ -1018,13 +1018,14 @@ Use the buttons below to manage your bots:
                 return
             status = "🟢 Running" if bot_id in RUNNING_BOTS else "🔴 Stopped"
             users = Database.get_bot_users(bot_id)
+            created_at = bot.get('created_at', 'Unknown')
             text = f"""
 📊 **Bot #{bot_id} Details**
 
 👤 Username: @{bot['bot_username'] or 'Unknown'}
 📛 Name: {bot['bot_name'] or 'N/A'}
 👑 Owner ID: `{bot['user_id']}`
-📅 Added: {bot['created_at']}
+📅 Added: {created_at}
 📍 Status: {status}
 👥 Authorized Users: {len(users)}
 """
@@ -1305,12 +1306,13 @@ Use `{target}` as placeholder
             status = "🟢 Running" if bot_id in RUNNING_BOTS else "🔴 Stopped"
             users = Database.get_bot_users(bot_id)
 
+            created_at = bot.get('created_at', 'Unknown')
             text = f"""
 📊 **Bot #{bot_id} Info**
 
 👤 Username: @{bot['bot_username'] or 'Unknown'}
 📛 Name: {bot['bot_name'] or 'N/A'}
-📅 Added: {bot['created_at']}
+📅 Added: {created_at}
 📍 Status: {status}
 👥 Authorized Users: {len(users)}
 """
