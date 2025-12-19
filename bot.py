@@ -13,9 +13,11 @@ import os
 import time
 import random
 import logging
-import json
 from typing import Dict, List, Set, Optional
 from datetime import datetime
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -31,8 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("HyperX")
 
+DATABASE_URL = os.environ.get('DATABASE_URL')
 CONTROLLER_TOKEN = "8492426300:AAEasavi51hrI8OqrbUQzkDmdf9OViSDS6c"
-DATA_DIR = "bot_data"
 
 WAITING_TOKEN = 1
 WAITING_OWNER_ID = 2
@@ -75,278 +77,393 @@ DEFAULT_SPAM_MESSAGES = [
 UNAUTHORIZED_MSG = "𝐃𝐄𝐕 𝐏𝐀𝐏𝐀 𝐒𝐄 𝐁𝐈𝐊𝐇 𝐌𝐀𝐍𝐆 🤣🎀😻"
 
 
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def load_json(filename: str, default=None):
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, 'r') as f:
-                return json.load(f)
-        except:
-            return default if default is not None else {}
-    return default if default is not None else {}
-
-
-def save_json(filename: str, data):
-    filepath = os.path.join(DATA_DIR, filename)
-    with open(filepath, 'w') as f:
-        json.dump(data, f, indent=2)
+def get_db():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_database():
-    ensure_data_dir()
-    load_json("users.json", {})
-    load_json("bots.json", {})
-    load_json("bot_users.json", {})
-    load_json("nc_templates.json", {})
-    load_json("spam_templates.json", {})
-    load_json("reply_templates.json", {})
-    load_json("permissions.json", {})
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            is_sudo BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_bots (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            bot_username TEXT,
+            bot_name TEXT,
+            is_running BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS bot_authorized_users (
+            id SERIAL PRIMARY KEY,
+            bot_id INTEGER REFERENCES user_bots(id) ON DELETE CASCADE,
+            user_id BIGINT NOT NULL,
+            added_by BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_id, user_id)
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_nc_templates (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            template TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_spam_templates (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            template TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_reply_templates (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            template TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS permissions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            permission TEXT NOT NULL,
+            granted_by BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, permission)
+        )
+    ''')
+
+    conn.commit()
+    cur.close()
+    conn.close()
     logger.info("Database initialized!")
 
 
 class Database:
-    _next_bot_id = 0
-    _next_template_id = {}
-
     @staticmethod
     def register_user(user_id: int, username: str = None):
-        users = load_json("users.json", {})
-        users[str(user_id)] = {'user_id': user_id, 'username': username, 'is_sudo': False}
-        save_json("users.json", users)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = %s', 
+                   (user_id, username, username))
+        conn.commit()
+        cur.close()
+        conn.close()
 
     @staticmethod
     def is_sudo(user_id: int) -> bool:
-        users = load_json("users.json", {})
-        user = users.get(str(user_id), {})
-        return user.get('is_sudo', False)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT is_sudo FROM users WHERE user_id = %s', (user_id,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result and result['is_sudo']
 
     @staticmethod
     def add_sudo(user_id: int) -> bool:
-        users = load_json("users.json", {})
-        if str(user_id) not in users:
-            users[str(user_id)] = {'user_id': user_id, 'username': None}
-        users[str(user_id)]['is_sudo'] = True
-        save_json("users.json", users)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO users (user_id, is_sudo) VALUES (%s, TRUE) ON CONFLICT (user_id) DO UPDATE SET is_sudo = TRUE', (user_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
         return True
 
     @staticmethod
     def remove_sudo(user_id: int) -> bool:
-        users = load_json("users.json", {})
-        if str(user_id) in users:
-            users[str(user_id)]['is_sudo'] = False
-            save_json("users.json", users)
-            return True
-        return False
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET is_sudo = FALSE WHERE user_id = %s', (user_id,))
+        affected = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return affected > 0
 
     @staticmethod
     def get_sudos() -> List[int]:
-        users = load_json("users.json", {})
-        return [int(k) for k, v in users.items() if v.get('is_sudo', False)]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM users WHERE is_sudo = TRUE')
+        users = [r['user_id'] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return users
 
     @staticmethod
     def add_bot(user_id: int, token: str, username: str = None, name: str = None) -> Optional[int]:
-        bots = load_json("bots.json", {})
-        for bot in bots.values():
-            if bot.get('token') == token:
-                return None
-        bot_id = max([int(k) for k in bots.keys()] + [0]) + 1
-        bots[str(bot_id)] = {'id': bot_id, 'user_id': user_id, 'token': token, 'bot_username': username, 'bot_name': name, 'is_running': False, 'created_at': datetime.now().isoformat()}
-        save_json("bots.json", bots)
-        return bot_id
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            cur.execute('INSERT INTO user_bots (user_id, token, bot_username, bot_name) VALUES (%s, %s, %s, %s) RETURNING id',
+                       (user_id, token, username, name))
+            result = cur.fetchone()
+            conn.commit()
+            return result['id'] if result else None
+        except psycopg2.IntegrityError:
+            conn.rollback()
+            return None
+        finally:
+            cur.close()
+            conn.close()
 
     @staticmethod
     def remove_bot(user_id: int, bot_id: int) -> bool:
-        bots = load_json("bots.json", {})
-        if str(bot_id) in bots and bots[str(bot_id)]['user_id'] == user_id:
-            del bots[str(bot_id)]
-            save_json("bots.json", bots)
-            return True
-        return False
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM user_bots WHERE id = %s AND user_id = %s', (bot_id, user_id))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
 
     @staticmethod
     def get_user_bots(user_id: int) -> List[dict]:
-        bots = load_json("bots.json", {})
-        return [b for b in bots.values() if b['user_id'] == user_id]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_bots WHERE user_id = %s ORDER BY id', (user_id,))
+        bots = cur.fetchall()
+        cur.close()
+        conn.close()
+        return bots
 
     @staticmethod
     def get_bot(bot_id: int) -> Optional[dict]:
-        bots = load_json("bots.json", {})
-        return bots.get(str(bot_id))
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_bots WHERE id = %s', (bot_id,))
+        bot = cur.fetchone()
+        cur.close()
+        conn.close()
+        return bot
 
     @staticmethod
     def get_bot_by_token(token: str) -> Optional[dict]:
-        bots = load_json("bots.json", {})
-        for bot in bots.values():
-            if bot['token'] == token:
-                return bot
-        return None
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_bots WHERE token = %s', (token,))
+        bot = cur.fetchone()
+        cur.close()
+        conn.close()
+        return bot
 
     @staticmethod
     def update_bot_status(bot_id: int, is_running: bool):
-        bots = load_json("bots.json", {})
-        if str(bot_id) in bots:
-            bots[str(bot_id)]['is_running'] = is_running
-            save_json("bots.json", bots)
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE user_bots SET is_running = %s WHERE id = %s', (is_running, bot_id))
+        conn.commit()
+        cur.close()
+        conn.close()
 
     @staticmethod
     def update_bot_info(token: str, username: str, name: str):
-        bots = load_json("bots.json", {})
-        for bot in bots.values():
-            if bot['token'] == token:
-                bot['bot_username'] = username
-                bot['bot_name'] = name
-                save_json("bots.json", bots)
-                break
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE user_bots SET bot_username = %s, bot_name = %s WHERE token = %s', (username, name, token))
+        conn.commit()
+        cur.close()
+        conn.close()
 
     @staticmethod
     def add_bot_user(bot_id: int, user_id: int, added_by: int) -> bool:
-        bot_users = load_json("bot_users.json", {})
-        key = f"{bot_id}_{user_id}"
-        if key not in bot_users:
-            bot_users[key] = {'bot_id': bot_id, 'user_id': user_id}
-            save_json("bot_users.json", bot_users)
-            return True
-        return False
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            cur.execute('INSERT INTO bot_authorized_users (bot_id, user_id, added_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
+                       (bot_id, user_id, added_by))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            cur.close()
+            conn.close()
 
     @staticmethod
     def remove_bot_user(bot_id: int, user_id: int) -> bool:
-        bot_users = load_json("bot_users.json", {})
-        key = f"{bot_id}_{user_id}"
-        if key in bot_users:
-            del bot_users[key]
-            save_json("bot_users.json", bot_users)
-            return True
-        return False
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM bot_authorized_users WHERE bot_id = %s AND user_id = %s', (bot_id, user_id))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
 
     @staticmethod
     def get_bot_users(bot_id: int) -> List[int]:
-        bot_users = load_json("bot_users.json", {})
-        return [u['user_id'] for u in bot_users.values() if u['bot_id'] == bot_id]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT user_id FROM bot_authorized_users WHERE bot_id = %s', (bot_id,))
+        users = [r['user_id'] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return users
 
     @staticmethod
     def add_nc_template(user_id: int, template: str) -> int:
-        templates = load_json("nc_templates.json", {})
-        template_id = max([int(k.split('_')[1]) for k in templates.keys() if k.startswith(f"{user_id}_")] + [0]) + 1
-        key = f"{user_id}_{template_id}"
-        templates[key] = {'id': template_id, 'user_id': user_id, 'template': template}
-        save_json("nc_templates.json", templates)
-        return template_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO user_nc_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return result['id']
 
     @staticmethod
     def get_nc_templates(user_id: int) -> List[dict]:
-        templates = load_json("nc_templates.json", {})
-        return [t for t in templates.values() if t['user_id'] == user_id]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_nc_templates WHERE user_id = %s ORDER BY id', (user_id,))
+        templates = cur.fetchall()
+        cur.close()
+        conn.close()
+        return templates
 
     @staticmethod
     def remove_nc_template(user_id: int, template_id: int = None) -> int:
-        templates = load_json("nc_templates.json", {})
+        conn = get_db()
+        cur = conn.cursor()
         if template_id:
-            key = f"{user_id}_{template_id}"
-            if key in templates:
-                del templates[key]
-                save_json("nc_templates.json", templates)
-                return 1
-            return 0
+            cur.execute('DELETE FROM user_nc_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
         else:
-            count = len([k for k in templates.keys() if k.startswith(f"{user_id}_")])
-            templates = {k: v for k, v in templates.items() if v['user_id'] != user_id}
-            save_json("nc_templates.json", templates)
-            return count
+            cur.execute('DELETE FROM user_nc_templates WHERE user_id = %s', (user_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
 
     @staticmethod
     def add_spam_template(user_id: int, template: str) -> int:
-        templates = load_json("spam_templates.json", {})
-        template_id = max([int(k.split('_')[1]) for k in templates.keys() if k.startswith(f"{user_id}_")] + [0]) + 1
-        key = f"{user_id}_{template_id}"
-        templates[key] = {'id': template_id, 'user_id': user_id, 'template': template}
-        save_json("spam_templates.json", templates)
-        return template_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO user_spam_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return result['id']
 
     @staticmethod
     def get_spam_templates(user_id: int) -> List[dict]:
-        templates = load_json("spam_templates.json", {})
-        return [t for t in templates.values() if t['user_id'] == user_id]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_spam_templates WHERE user_id = %s ORDER BY id', (user_id,))
+        templates = cur.fetchall()
+        cur.close()
+        conn.close()
+        return templates
 
     @staticmethod
     def remove_spam_template(user_id: int, template_id: int = None) -> int:
-        templates = load_json("spam_templates.json", {})
+        conn = get_db()
+        cur = conn.cursor()
         if template_id:
-            key = f"{user_id}_{template_id}"
-            if key in templates:
-                del templates[key]
-                save_json("spam_templates.json", templates)
-                return 1
-            return 0
+            cur.execute('DELETE FROM user_spam_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
         else:
-            count = len([k for k in templates.keys() if k.startswith(f"{user_id}_")])
-            templates = {k: v for k, v in templates.items() if v['user_id'] != user_id}
-            save_json("spam_templates.json", templates)
-            return count
+            cur.execute('DELETE FROM user_spam_templates WHERE user_id = %s', (user_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
 
     @staticmethod
     def add_reply_template(user_id: int, template: str) -> int:
-        templates = load_json("reply_templates.json", {})
-        template_id = max([int(k.split('_')[1]) for k in templates.keys() if k.startswith(f"{user_id}_")] + [0]) + 1
-        key = f"{user_id}_{template_id}"
-        templates[key] = {'id': template_id, 'user_id': user_id, 'template': template}
-        save_json("reply_templates.json", templates)
-        return template_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('INSERT INTO user_reply_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
+        result = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return result['id']
 
     @staticmethod
     def get_reply_templates(user_id: int) -> List[dict]:
-        templates = load_json("reply_templates.json", {})
-        return [t for t in templates.values() if t['user_id'] == user_id]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT * FROM user_reply_templates WHERE user_id = %s ORDER BY id', (user_id,))
+        templates = cur.fetchall()
+        cur.close()
+        conn.close()
+        return templates
 
     @staticmethod
     def remove_reply_template(user_id: int, template_id: int = None) -> int:
-        templates = load_json("reply_templates.json", {})
+        conn = get_db()
+        cur = conn.cursor()
         if template_id:
-            key = f"{user_id}_{template_id}"
-            if key in templates:
-                del templates[key]
-                save_json("reply_templates.json", templates)
-                return 1
-            return 0
+            cur.execute('DELETE FROM user_reply_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
         else:
-            count = len([k for k in templates.keys() if k.startswith(f"{user_id}_")])
-            templates = {k: v for k, v in templates.items() if v['user_id'] != user_id}
-            save_json("reply_templates.json", templates)
-            return count
+            cur.execute('DELETE FROM user_reply_templates WHERE user_id = %s', (user_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
 
     @staticmethod
     def grant_permission(user_id: int, permission: str, granted_by: int) -> bool:
-        perms = load_json("permissions.json", {})
-        key = f"{user_id}_{permission}"
-        if key not in perms:
-            perms[key] = {'user_id': user_id, 'permission': permission}
-            save_json("permissions.json", perms)
-            return True
-        return False
+        conn = get_db()
+        cur = conn.cursor()
+        try:
+            cur.execute('INSERT INTO permissions (user_id, permission, granted_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
+                       (user_id, permission, granted_by))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            cur.close()
+            conn.close()
 
     @staticmethod
     def revoke_permission(user_id: int, permission: str = None) -> bool:
-        perms = load_json("permissions.json", {})
+        conn = get_db()
+        cur = conn.cursor()
         if permission:
-            key = f"{user_id}_{permission}"
-            if key in perms:
-                del perms[key]
-                save_json("permissions.json", perms)
-                return True
-            return False
+            cur.execute('DELETE FROM permissions WHERE user_id = %s AND permission = %s', (user_id, permission))
         else:
-            count = len([k for k in perms.keys() if k.startswith(f"{user_id}_")])
-            perms = {k: v for k, v in perms.items() if v['user_id'] != user_id}
-            save_json("permissions.json", perms)
-            return count > 0
+            cur.execute('DELETE FROM permissions WHERE user_id = %s', (user_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+        return deleted
 
     @staticmethod
     def get_permissions(user_id: int) -> List[str]:
-        perms = load_json("permissions.json", {})
-        return [p['permission'] for p in perms.values() if p['user_id'] == user_id]
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT permission FROM permissions WHERE user_id = %s', (user_id,))
+        perms = [r['permission'] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return perms
 
     @staticmethod
     def has_permission(user_id: int, permission: str) -> bool:
@@ -872,6 +989,7 @@ class ControllerBot:
         keyboard = [
             [InlineKeyboardButton("📝 NC Templates", callback_data="tpl_nc"),
              InlineKeyboardButton("💬 Spam Templates", callback_data="tpl_spam")],
+            [InlineKeyboardButton("💭 Reply Templates", callback_data="tpl_reply")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")]
         ]
         return InlineKeyboardMarkup(keyboard)
@@ -922,6 +1040,8 @@ Use the buttons below to manage your bots:
             )
 
         elif data == "menu_addbot":
+            context.user_data['adding_bot'] = True
+            context.user_data['bot_step'] = 'token'
             await query.edit_message_text(
                 "🤖 **Add New Bot**\n\n"
                 "Please send me the bot token from @BotFather:\n\n"
@@ -929,7 +1049,6 @@ Use the buttons below to manage your bots:
                 "Send /cancel to cancel.",
                 parse_mode=ParseMode.MARKDOWN
             )
-            return WAITING_TOKEN
 
         elif data == "menu_listbots":
             bots = Database.get_user_bots(user_id)
@@ -1018,14 +1137,13 @@ Use the buttons below to manage your bots:
                 return
             status = "🟢 Running" if bot_id in RUNNING_BOTS else "🔴 Stopped"
             users = Database.get_bot_users(bot_id)
-            created_at = bot.get('created_at', 'Unknown')
             text = f"""
 📊 **Bot #{bot_id} Details**
 
 👤 Username: @{bot['bot_username'] or 'Unknown'}
 📛 Name: {bot['bot_name'] or 'N/A'}
 👑 Owner ID: `{bot['user_id']}`
-📅 Added: {created_at}
+📅 Added: {bot['created_at']}
 📍 Status: {status}
 👥 Authorized Users: {len(users)}
 """
@@ -1082,7 +1200,14 @@ Use the buttons below to manage your bots:
                     RUNNING_BOTS[bot['id']] = child
                     asyncio.create_task(child.run())
                     started += 1
-            await query.answer(f"Started {started} bots!", show_alert=True)
+            
+            if started > 0:
+                text = f"✅ **All Bots Started!**\n\n🟢 Started {started} bot(s)"
+            else:
+                text = "⚠️ **All bots are already running!**"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
         elif data == "menu_stopall":
             bots = Database.get_user_bots(user_id)
@@ -1097,7 +1222,8 @@ Use the buttons below to manage your bots:
         elif data == "menu_templates":
             nc_count = len(Database.get_nc_templates(user_id))
             spam_count = len(Database.get_spam_templates(user_id))
-            text = f"📝 **Your Templates**\n\nNC Templates: {nc_count}\nSpam Templates: {spam_count}"
+            reply_count = len(Database.get_reply_templates(user_id))
+            text = f"📝 **Your Templates**\n\nNC Templates: {nc_count}\nSpam Templates: {spam_count}\nReply Templates: {reply_count}"
             await query.edit_message_text(text, reply_markup=self.get_templates_menu(), parse_mode=ParseMode.MARKDOWN)
 
         elif data == "tpl_nc":
@@ -1124,11 +1250,24 @@ Use the buttons below to manage your bots:
             keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu_templates")]]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
+        elif data == "tpl_reply":
+            templates = Database.get_reply_templates(user_id)
+            text = "💭 **Reply Templates:**\n\n"
+            if templates:
+                for t in templates:
+                    text += f"**#{t['id']}:** {t['template'][:40]}...\n"
+            else:
+                text += "_No templates. Using defaults._\n"
+            text += "\nTo add: `/addreply <template>`\nTo remove: `/removereply <id/all>`"
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="menu_templates")]]
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
         elif data == "menu_status":
             bots = Database.get_user_bots(user_id)
             running = sum(1 for b in bots if b['id'] in RUNNING_BOTS)
             nc_count = len(Database.get_nc_templates(user_id))
             spam_count = len(Database.get_spam_templates(user_id))
+            reply_count = len(Database.get_reply_templates(user_id))
             text = f"""
 📊 **Your Status**
 
@@ -1139,6 +1278,7 @@ Use the buttons below to manage your bots:
 
 📝 NC Templates: {nc_count}
 💬 Spam Templates: {spam_count}
+💭 Reply Templates: {reply_count}
 """
             keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")]]
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
@@ -1191,6 +1331,9 @@ Use `{target}` as placeholder
 
         if Database.get_bot_by_token(token):
             await update.message.reply_text("❌ This bot is already registered!")
+            if 'adding_bot' in context.user_data:
+                context.user_data.pop('adding_bot', None)
+                context.user_data.pop('bot_step', None)
             return ConversationHandler.END
 
         try:
@@ -1202,6 +1345,9 @@ Use `{target}` as placeholder
             context.user_data['pending_token'] = token
             context.user_data['pending_bot_username'] = bot_info.username
             context.user_data['pending_bot_name'] = bot_info.first_name
+
+            if 'adding_bot' in context.user_data:
+                context.user_data['bot_step'] = 'owner_id'
 
             await update.message.reply_text(
                 f"✅ **Token Valid!**\n\n"
@@ -1215,6 +1361,9 @@ Use `{target}` as placeholder
 
         except Exception as e:
             await update.message.reply_text(f"❌ Invalid token or error: {e}")
+            if 'adding_bot' in context.user_data:
+                context.user_data.pop('adding_bot', None)
+                context.user_data.pop('bot_step', None)
             return ConversationHandler.END
 
     async def receive_owner_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1306,13 +1455,12 @@ Use `{target}` as placeholder
             status = "🟢 Running" if bot_id in RUNNING_BOTS else "🔴 Stopped"
             users = Database.get_bot_users(bot_id)
 
-            created_at = bot.get('created_at', 'Unknown')
             text = f"""
 📊 **Bot #{bot_id} Info**
 
 👤 Username: @{bot['bot_username'] or 'Unknown'}
 📛 Name: {bot['bot_name'] or 'N/A'}
-📅 Added: {created_at}
+📅 Added: {bot['created_at']}
 📍 Status: {status}
 👥 Authorized Users: {len(users)}
 """
@@ -1586,6 +1734,19 @@ Use `{target}` as placeholder
 """
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+    async def handle_bot_flow_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.user_data.get('adding_bot'):
+            return
+        
+        if context.user_data.get('bot_step') == 'token':
+            await self.receive_token(update, context)
+            if context.user_data.get('bot_step') == 'owner_id':
+                pass
+        elif context.user_data.get('bot_step') == 'owner_id':
+            await self.receive_owner_id(update, context)
+            context.user_data.pop('adding_bot', None)
+            context.user_data.pop('bot_step', None)
+
     def build(self) -> Application:
         app = Application.builder().token(CONTROLLER_TOKEN).build()
 
@@ -1608,6 +1769,7 @@ Use `{target}` as placeholder
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_start))
         app.add_handler(CallbackQueryHandler(self.callback_handler))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_bot_flow_message))
         app.add_handler(CommandHandler("removebot", self.cmd_removebot))
         app.add_handler(CommandHandler("listbots", self.cmd_listbots))
         app.add_handler(CommandHandler("botinfo", self.cmd_botinfo))
@@ -1639,6 +1801,10 @@ async def main():
 
     if not CONTROLLER_TOKEN:
         print("❌ ERROR: Set CONTROLLER_BOT_TOKEN environment variable!")
+        return
+
+    if not DATABASE_URL:
+        print("❌ ERROR: Set DATABASE_URL environment variable!")
         return
 
     init_database()
