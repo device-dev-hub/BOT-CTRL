@@ -13,11 +13,10 @@ import os
 import time
 import random
 import logging
+import json
 from typing import Dict, List, Set, Optional
 from datetime import datetime
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("HyperX")
 
-DATABASE_URL = os.environ.get('DATABASE_URL')
+DATA_FILE = "bot_data.json"
 CONTROLLER_TOKEN = "8492426300:AAEasavi51hrI8OqrbUQzkDmdf9OViSDS6c"
 
 WAITING_TOKEN = 1
@@ -77,393 +76,357 @@ DEFAULT_SPAM_MESSAGES = [
 UNAUTHORIZED_MSG = "𝐃𝐄𝐕 𝐏𝐀𝐏𝐀 𝐒𝐄 𝐁𝐈𝐊𝐇 𝐌𝐀𝐍𝐆 🤣🎀😻"
 
 
-def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-
-
 def init_database():
-    conn = get_db()
-    cur = conn.cursor()
+    if not Path(DATA_FILE).exists():
+        data = {
+            "users": {},
+            "bots": {},
+            "bot_users": {},
+            "nc_templates": {},
+            "spam_templates": {},
+            "reply_templates": {},
+            "permissions": {},
+            "next_bot_id": 1
+        }
+        save_data(data)
+    logger.info("Data storage initialized!")
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            is_sudo BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS user_bots (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            token TEXT UNIQUE NOT NULL,
-            bot_username TEXT,
-            bot_name TEXT,
-            is_running BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+def load_data() -> dict:
+    if Path(DATA_FILE).exists():
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    return {
+        "users": {},
+        "bots": {},
+        "bot_users": {},
+        "nc_templates": {},
+        "spam_templates": {},
+        "reply_templates": {},
+        "permissions": {},
+        "next_bot_id": 1
+    }
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS bot_authorized_users (
-            id SERIAL PRIMARY KEY,
-            bot_id INTEGER REFERENCES user_bots(id) ON DELETE CASCADE,
-            user_id BIGINT NOT NULL,
-            added_by BIGINT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(bot_id, user_id)
-        )
-    ''')
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS user_nc_templates (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            template TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS user_spam_templates (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            template TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS user_reply_templates (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            template TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS permissions (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            permission TEXT NOT NULL,
-            granted_by BIGINT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, permission)
-        )
-    ''')
-
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Database initialized!")
+def save_data(data: dict):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
 
 
 class Database:
     @staticmethod
     def register_user(user_id: int, username: str = None):
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = %s', 
-                   (user_id, username, username))
-        conn.commit()
-        cur.close()
-        conn.close()
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str not in data["users"]:
+            data["users"][user_id_str] = {
+                "user_id": user_id,
+                "username": username,
+                "is_sudo": False,
+                "created_at": datetime.now().isoformat()
+            }
+        else:
+            data["users"][user_id_str]["username"] = username
+        save_data(data)
 
     @staticmethod
     def is_sudo(user_id: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT is_sudo FROM users WHERE user_id = %s', (user_id,))
-        result = cur.fetchone()
-        cur.close()
-        conn.close()
-        return result and result['is_sudo']
+        data = load_data()
+        user = data["users"].get(str(user_id))
+        return user and user.get("is_sudo", False)
 
     @staticmethod
     def add_sudo(user_id: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO users (user_id, is_sudo) VALUES (%s, TRUE) ON CONFLICT (user_id) DO UPDATE SET is_sudo = TRUE', (user_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str not in data["users"]:
+            data["users"][user_id_str] = {
+                "user_id": user_id,
+                "username": None,
+                "is_sudo": True,
+                "created_at": datetime.now().isoformat()
+            }
+        else:
+            data["users"][user_id_str]["is_sudo"] = True
+        save_data(data)
         return True
 
     @staticmethod
     def remove_sudo(user_id: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('UPDATE users SET is_sudo = FALSE WHERE user_id = %s', (user_id,))
-        affected = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        return affected > 0
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str in data["users"]:
+            data["users"][user_id_str]["is_sudo"] = False
+            save_data(data)
+            return True
+        return False
 
     @staticmethod
     def get_sudos() -> List[int]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT user_id FROM users WHERE is_sudo = TRUE')
-        users = [r['user_id'] for r in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return users
+        data = load_data()
+        return [int(uid) for uid, user in data["users"].items() if user.get("is_sudo", False)]
 
     @staticmethod
     def add_bot(user_id: int, token: str, username: str = None, name: str = None) -> Optional[int]:
-        conn = get_db()
-        cur = conn.cursor()
-        try:
-            cur.execute('INSERT INTO user_bots (user_id, token, bot_username, bot_name) VALUES (%s, %s, %s, %s) RETURNING id',
-                       (user_id, token, username, name))
-            result = cur.fetchone()
-            conn.commit()
-            return result['id'] if result else None
-        except psycopg2.IntegrityError:
-            conn.rollback()
+        data = load_data()
+        token_exists = any(b.get("token") == token for b in data["bots"].values())
+        if token_exists:
             return None
-        finally:
-            cur.close()
-            conn.close()
+        
+        bot_id = data["next_bot_id"]
+        data["bots"][str(bot_id)] = {
+            "id": bot_id,
+            "user_id": user_id,
+            "token": token,
+            "bot_username": username,
+            "bot_name": name,
+            "is_running": False,
+            "created_at": datetime.now().isoformat()
+        }
+        data["next_bot_id"] += 1
+        save_data(data)
+        return bot_id
 
     @staticmethod
     def remove_bot(user_id: int, bot_id: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM user_bots WHERE id = %s AND user_id = %s', (bot_id, user_id))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        data = load_data()
+        bot_id_str = str(bot_id)
+        if bot_id_str in data["bots"]:
+            bot = data["bots"][bot_id_str]
+            if bot["user_id"] == user_id:
+                del data["bots"][bot_id_str]
+                if bot_id_str in data["bot_users"]:
+                    del data["bot_users"][bot_id_str]
+                save_data(data)
+                return True
+        return False
 
     @staticmethod
     def get_user_bots(user_id: int) -> List[dict]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM user_bots WHERE user_id = %s ORDER BY id', (user_id,))
-        bots = cur.fetchall()
-        cur.close()
-        conn.close()
-        return bots
+        data = load_data()
+        bots = [b for b in data["bots"].values() if b["user_id"] == user_id]
+        return sorted(bots, key=lambda x: x["id"])
 
     @staticmethod
     def get_bot(bot_id: int) -> Optional[dict]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM user_bots WHERE id = %s', (bot_id,))
-        bot = cur.fetchone()
-        cur.close()
-        conn.close()
-        return bot
+        data = load_data()
+        bot_id_str = str(bot_id)
+        return data["bots"].get(bot_id_str)
 
     @staticmethod
     def get_bot_by_token(token: str) -> Optional[dict]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM user_bots WHERE token = %s', (token,))
-        bot = cur.fetchone()
-        cur.close()
-        conn.close()
-        return bot
+        data = load_data()
+        for bot in data["bots"].values():
+            if bot.get("token") == token:
+                return bot
+        return None
 
     @staticmethod
     def update_bot_status(bot_id: int, is_running: bool):
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('UPDATE user_bots SET is_running = %s WHERE id = %s', (is_running, bot_id))
-        conn.commit()
-        cur.close()
-        conn.close()
+        data = load_data()
+        bot_id_str = str(bot_id)
+        if bot_id_str in data["bots"]:
+            data["bots"][bot_id_str]["is_running"] = is_running
+            save_data(data)
 
     @staticmethod
     def update_bot_info(token: str, username: str, name: str):
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('UPDATE user_bots SET bot_username = %s, bot_name = %s WHERE token = %s', (username, name, token))
-        conn.commit()
-        cur.close()
-        conn.close()
+        data = load_data()
+        for bot in data["bots"].values():
+            if bot.get("token") == token:
+                bot["bot_username"] = username
+                bot["bot_name"] = name
+                save_data(data)
+                break
 
     @staticmethod
     def add_bot_user(bot_id: int, user_id: int, added_by: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        try:
-            cur.execute('INSERT INTO bot_authorized_users (bot_id, user_id, added_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
-                       (bot_id, user_id, added_by))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            cur.close()
-            conn.close()
+        data = load_data()
+        bot_id_str = str(bot_id)
+        if bot_id_str not in data["bot_users"]:
+            data["bot_users"][bot_id_str] = []
+        if user_id not in data["bot_users"][bot_id_str]:
+            data["bot_users"][bot_id_str].append(user_id)
+            save_data(data)
+            return True
+        return False
 
     @staticmethod
     def remove_bot_user(bot_id: int, user_id: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM bot_authorized_users WHERE bot_id = %s AND user_id = %s', (bot_id, user_id))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        data = load_data()
+        bot_id_str = str(bot_id)
+        if bot_id_str in data["bot_users"]:
+            if user_id in data["bot_users"][bot_id_str]:
+                data["bot_users"][bot_id_str].remove(user_id)
+                save_data(data)
+                return True
+        return False
 
     @staticmethod
     def get_bot_users(bot_id: int) -> List[int]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT user_id FROM bot_authorized_users WHERE bot_id = %s', (bot_id,))
-        users = [r['user_id'] for r in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return users
+        data = load_data()
+        bot_id_str = str(bot_id)
+        return data["bot_users"].get(bot_id_str, [])
 
     @staticmethod
     def add_nc_template(user_id: int, template: str) -> int:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO user_nc_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
-        return result['id']
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str not in data["nc_templates"]:
+            data["nc_templates"][user_id_str] = {"next_id": 1, "templates": {}}
+        
+        tpl_id = data["nc_templates"][user_id_str]["next_id"]
+        data["nc_templates"][user_id_str]["templates"][str(tpl_id)] = {
+            "id": tpl_id,
+            "template": template,
+            "created_at": datetime.now().isoformat()
+        }
+        data["nc_templates"][user_id_str]["next_id"] += 1
+        save_data(data)
+        return tpl_id
 
     @staticmethod
     def get_nc_templates(user_id: int) -> List[dict]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM user_nc_templates WHERE user_id = %s ORDER BY id', (user_id,))
-        templates = cur.fetchall()
-        cur.close()
-        conn.close()
-        return templates
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str in data["nc_templates"]:
+            templates = list(data["nc_templates"][user_id_str]["templates"].values())
+            return sorted(templates, key=lambda x: x["id"])
+        return []
 
     @staticmethod
     def remove_nc_template(user_id: int, template_id: int = None) -> int:
-        conn = get_db()
-        cur = conn.cursor()
-        if template_id:
-            cur.execute('DELETE FROM user_nc_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
-        else:
-            cur.execute('DELETE FROM user_nc_templates WHERE user_id = %s', (user_id,))
-        deleted = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        data = load_data()
+        user_id_str = str(user_id)
+        count = 0
+        if user_id_str in data["nc_templates"]:
+            if template_id:
+                if str(template_id) in data["nc_templates"][user_id_str]["templates"]:
+                    del data["nc_templates"][user_id_str]["templates"][str(template_id)]
+                    count = 1
+            else:
+                count = len(data["nc_templates"][user_id_str]["templates"])
+                data["nc_templates"][user_id_str]["templates"] = {}
+            save_data(data)
+        return count
 
     @staticmethod
     def add_spam_template(user_id: int, template: str) -> int:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO user_spam_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
-        return result['id']
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str not in data["spam_templates"]:
+            data["spam_templates"][user_id_str] = {"next_id": 1, "templates": {}}
+        
+        tpl_id = data["spam_templates"][user_id_str]["next_id"]
+        data["spam_templates"][user_id_str]["templates"][str(tpl_id)] = {
+            "id": tpl_id,
+            "template": template,
+            "created_at": datetime.now().isoformat()
+        }
+        data["spam_templates"][user_id_str]["next_id"] += 1
+        save_data(data)
+        return tpl_id
 
     @staticmethod
     def get_spam_templates(user_id: int) -> List[dict]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM user_spam_templates WHERE user_id = %s ORDER BY id', (user_id,))
-        templates = cur.fetchall()
-        cur.close()
-        conn.close()
-        return templates
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str in data["spam_templates"]:
+            templates = list(data["spam_templates"][user_id_str]["templates"].values())
+            return sorted(templates, key=lambda x: x["id"])
+        return []
 
     @staticmethod
     def remove_spam_template(user_id: int, template_id: int = None) -> int:
-        conn = get_db()
-        cur = conn.cursor()
-        if template_id:
-            cur.execute('DELETE FROM user_spam_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
-        else:
-            cur.execute('DELETE FROM user_spam_templates WHERE user_id = %s', (user_id,))
-        deleted = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        data = load_data()
+        user_id_str = str(user_id)
+        count = 0
+        if user_id_str in data["spam_templates"]:
+            if template_id:
+                if str(template_id) in data["spam_templates"][user_id_str]["templates"]:
+                    del data["spam_templates"][user_id_str]["templates"][str(template_id)]
+                    count = 1
+            else:
+                count = len(data["spam_templates"][user_id_str]["templates"])
+                data["spam_templates"][user_id_str]["templates"] = {}
+            save_data(data)
+        return count
 
     @staticmethod
     def add_reply_template(user_id: int, template: str) -> int:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO user_reply_templates (user_id, template) VALUES (%s, %s) RETURNING id', (user_id, template))
-        result = cur.fetchone()
-        conn.commit()
-        cur.close()
-        conn.close()
-        return result['id']
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str not in data["reply_templates"]:
+            data["reply_templates"][user_id_str] = {"next_id": 1, "templates": {}}
+        
+        tpl_id = data["reply_templates"][user_id_str]["next_id"]
+        data["reply_templates"][user_id_str]["templates"][str(tpl_id)] = {
+            "id": tpl_id,
+            "template": template,
+            "created_at": datetime.now().isoformat()
+        }
+        data["reply_templates"][user_id_str]["next_id"] += 1
+        save_data(data)
+        return tpl_id
 
     @staticmethod
     def get_reply_templates(user_id: int) -> List[dict]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM user_reply_templates WHERE user_id = %s ORDER BY id', (user_id,))
-        templates = cur.fetchall()
-        cur.close()
-        conn.close()
-        return templates
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str in data["reply_templates"]:
+            templates = list(data["reply_templates"][user_id_str]["templates"].values())
+            return sorted(templates, key=lambda x: x["id"])
+        return []
 
     @staticmethod
     def remove_reply_template(user_id: int, template_id: int = None) -> int:
-        conn = get_db()
-        cur = conn.cursor()
-        if template_id:
-            cur.execute('DELETE FROM user_reply_templates WHERE user_id = %s AND id = %s', (user_id, template_id))
-        else:
-            cur.execute('DELETE FROM user_reply_templates WHERE user_id = %s', (user_id,))
-        deleted = cur.rowcount
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        data = load_data()
+        user_id_str = str(user_id)
+        count = 0
+        if user_id_str in data["reply_templates"]:
+            if template_id:
+                if str(template_id) in data["reply_templates"][user_id_str]["templates"]:
+                    del data["reply_templates"][user_id_str]["templates"][str(template_id)]
+                    count = 1
+            else:
+                count = len(data["reply_templates"][user_id_str]["templates"])
+                data["reply_templates"][user_id_str]["templates"] = {}
+            save_data(data)
+        return count
 
     @staticmethod
     def grant_permission(user_id: int, permission: str, granted_by: int) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        try:
-            cur.execute('INSERT INTO permissions (user_id, permission, granted_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING',
-                       (user_id, permission, granted_by))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            cur.close()
-            conn.close()
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str not in data["permissions"]:
+            data["permissions"][user_id_str] = []
+        if permission not in data["permissions"][user_id_str]:
+            data["permissions"][user_id_str].append(permission)
+            save_data(data)
+            return True
+        return False
 
     @staticmethod
     def revoke_permission(user_id: int, permission: str = None) -> bool:
-        conn = get_db()
-        cur = conn.cursor()
-        if permission:
-            cur.execute('DELETE FROM permissions WHERE user_id = %s AND permission = %s', (user_id, permission))
-        else:
-            cur.execute('DELETE FROM permissions WHERE user_id = %s', (user_id,))
-        deleted = cur.rowcount > 0
-        conn.commit()
-        cur.close()
-        conn.close()
-        return deleted
+        data = load_data()
+        user_id_str = str(user_id)
+        if user_id_str in data["permissions"]:
+            if permission:
+                if permission in data["permissions"][user_id_str]:
+                    data["permissions"][user_id_str].remove(permission)
+                    save_data(data)
+                    return True
+            else:
+                data["permissions"][user_id_str] = []
+                save_data(data)
+                return True
+        return False
 
     @staticmethod
     def get_permissions(user_id: int) -> List[str]:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT permission FROM permissions WHERE user_id = %s', (user_id,))
-        perms = [r['permission'] for r in cur.fetchall()]
-        cur.close()
-        conn.close()
-        return perms
+        data = load_data()
+        user_id_str = str(user_id)
+        return data["permissions"].get(user_id_str, [])
 
     @staticmethod
     def has_permission(user_id: int, permission: str) -> bool:
@@ -642,328 +605,363 @@ class ChildBot:
             except:
                 self.stats["errors"] += 1
 
-    async def reply_loop(self, chat_id, target, context):
-        count = 0
+    async def reply_loop(self, chat_id, context):
+        target = self.reply_targets.get(chat_id, "User")
+        idx = 0
+        msgs = self.get_reply_messages()
         while self.running:
             try:
-                delay = self.delays.get(chat_id, 0)
-                if chat_id in self.pending_replies and self.pending_replies[chat_id]:
-                    async with self.get_lock(chat_id):
-                        msgs = self.pending_replies[chat_id].copy()
-                        self.pending_replies[chat_id] = []
-                    msgs_list = self.get_reply_messages()
-                    for msg_id in msgs:
-                        try:
-                            reply = random.choice(msgs_list).format(target=target)
-                            await context.bot.send_message(chat_id=chat_id, text=reply, reply_to_message_id=msg_id)
-                            count += 1
-                            self.stats["sent"] += 1
-                            if delay > 0:
-                                await asyncio.sleep(delay)
-                        except asyncio.CancelledError:
-                            raise
-                        except:
-                            pass
-                else:
-                    await asyncio.sleep(0.02)
+                msg = msgs[idx % len(msgs)].format(target=target)
+                await context.bot.send_message(chat_id=chat_id, text=msg)
+                idx += 1
+                self.stats["sent"] += 1
+                await asyncio.sleep(random.uniform(2, 5))
             except asyncio.CancelledError:
                 break
+            except:
+                self.stats["errors"] += 1
 
-    async def msg_collector(self, update, context):
-        if not update.message:
-            return
-        chat_id = update.effective_chat.id
-        if chat_id in self.reply_targets:
-            async with self.get_lock(chat_id):
-                if chat_id not in self.pending_replies:
-                    self.pending_replies[chat_id] = []
-                self.pending_replies[chat_id].append(update.message.message_id)
+    async def run(self):
+        try:
+            self.app = Application.builder().token(self.token).build()
+            await self.app.initialize()
 
-    async def cmd_start(self, update, context):
+            bot_info = await self.app.bot.get_me()
+            Database.update_bot_info(self.token, bot_info.username, bot_info.first_name)
+
+            self.app.add_handler(CommandHandler("nc", self.cmd_nc))
+            self.app.add_handler(CommandHandler("spam", self.cmd_spam))
+            self.app.add_handler(CommandHandler("ctmnc", self.cmd_ctmnc))
+            self.app.add_handler(CommandHandler("reply", self.cmd_reply))
+            self.app.add_handler(CommandHandler("target", self.cmd_target))
+            self.app.add_handler(CommandHandler("delay", self.cmd_delay))
+            self.app.add_handler(CommandHandler("threads", self.cmd_threads))
+            self.app.add_handler(CommandHandler("stopall", self.cmd_stopall))
+            self.app.add_handler(CommandHandler("stats", self.cmd_stats))
+            self.app.add_handler(CommandHandler("adduser", self.cmd_adduser))
+            self.app.add_handler(CommandHandler("removeuser", self.cmd_removeuser))
+            self.app.add_handler(CommandHandler("addnc", self.cmd_addnc))
+            self.app.add_handler(CommandHandler("removenc", self.cmd_removenc))
+            self.app.add_handler(CommandHandler("addspam", self.cmd_addspam))
+            self.app.add_handler(CommandHandler("removespam", self.cmd_removespam))
+            self.app.add_handler(CommandHandler("addreply", self.cmd_addreply))
+            self.app.add_handler(CommandHandler("removereply", self.cmd_removereply))
+
+            await self.app.start()
+            logger.info(f"Child bot {self.bot_id} running: @{bot_info.username}")
+
+            await self.stop_event.wait()
+
+        except Exception as e:
+            logger.error(f"Error running bot {self.bot_id}: {e}")
+        finally:
+            await self.stop_all()
+            if self.app:
+                await self.app.stop()
+                await self.app.shutdown()
+            self.running = False
+            logger.info(f"Child bot {self.bot_id} stopped")
+
+    async def cmd_nc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
-            return
-        help_text = f"""
-𓆩 𝐁𝐎𝐓 #{self.bot_id} 𓆪 - ⚡ 𝐇𝐘𝐏𝐄𝐑-𝐗 𝐯𝟑.𝟎 ⚡
-
-━━━━ 𝐀𝐓𝐓𝐀𝐂𝐊 𝐂𝐎𝐌𝐌𝐀𝐍𝐃𝐒 ━━━━
-/target <name> - NC + SPAM together!
-/nc <name> - Name change LOOP
-/ctmnc <custom> - Custom name + heart!
-/spam <target> - Spam LOOP
-/reply <target> - Reply to every message!
-
-━━━━ 𝐂𝐎𝐍𝐓𝐑𝐎𝐋 ━━━━
-/delay <seconds> - Set delay (default: 0)
-/threads <1-50> - Set threads
-
-━━━━ 𝐒𝐓𝐎𝐏 ━━━━
-/stopnc - Stop NC loop
-/stopctmnc - Stop custom NC
-/stopspam - Stop spam loop
-/stopreply - Stop reply loop
-/stopall - Stop ALL loops
-
-━━━━ 𝐔𝐓𝐈𝐋𝐈𝐓𝐘 ━━━━
-/ping - Bot latency
-/status - Live stats
-"""
-        await update.message.reply_text(help_text)
-
-    async def cmd_nc(self, update, context):
-        if not await self.check_auth(update):
-            return
-        chat = update.effective_chat
-        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            await update.message.reply_text("Groups only!")
             return
         if not context.args:
-            await update.message.reply_text("Usage: /nc <name>")
+            await update.message.reply_text("Usage: /nc <target_name>")
             return
+
+        chat_id = update.effective_chat.id
         target = " ".join(context.args)
-        chat_id = chat.id
-        async with get_lock(chat_id):
+        lock = self.get_lock(chat_id)
+        async with lock:
             if chat_id in self.active_nc:
-                await self.cancel_tasks(self.active_nc[chat_id])
-            num = self.threads.get(chat_id, 1)
-            tasks = [asyncio.create_task(self.nc_loop(chat_id, target, context, i+1)) for i in range(num)]
-            self.active_nc[chat_id] = tasks
-        await update.message.reply_text(f"[Bot #{self.bot_id}] NC started with {num} threads!")
+                await update.message.reply_text("✅ NC already running in this chat")
+                return
 
-    async def cmd_stop_nc(self, update, context):
-        if not await self.check_auth(update):
-            return
-        chat_id = update.effective_chat.id
-        async with get_lock(chat_id):
-            if chat_id in self.active_nc:
-                await self.cancel_tasks(self.active_nc[chat_id])
-                del self.active_nc[chat_id]
-                await update.message.reply_text(f"[Bot #{self.bot_id}] NC stopped!")
-            else:
-                await update.message.reply_text("No active NC loop!")
+            threads = self.threads.get(chat_id, 1)
+            self.active_nc[chat_id] = []
+            for i in range(threads):
+                task = asyncio.create_task(self.nc_loop(chat_id, target, context, i+1))
+                self.active_nc[chat_id].append(task)
+            await update.message.reply_text(f"🚀 **NC Started** for {target}\n\n{threads} thread(s) | Delay: {self.delays.get(chat_id, 0)}s")
 
-    async def cmd_ctmnc(self, update, context):
+    async def cmd_spam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
-            return
-        chat = update.effective_chat
-        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            await update.message.reply_text("Groups only!")
             return
         if not context.args:
-            await update.message.reply_text("Usage: /ctmnc <custom name>")
+            await update.message.reply_text("Usage: /spam <target_name>")
             return
+
+        chat_id = update.effective_chat.id
+        target = " ".join(context.args)
+        lock = self.get_lock(chat_id)
+        async with lock:
+            if chat_id in self.active_spam:
+                await update.message.reply_text("✅ Spam already running in this chat")
+                return
+
+            threads = self.threads.get(chat_id, 1)
+            self.active_spam[chat_id] = []
+            for i in range(threads):
+                task = asyncio.create_task(self.spam_loop(chat_id, target, context, i+1))
+                self.active_spam[chat_id].append(task)
+            await update.message.reply_text(f"🚀 **Spam Started** for {target}\n\n{threads} thread(s) | Delay: {self.delays.get(chat_id, 0)}s")
+
+    async def cmd_ctmnc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /ctmnc <custom_text>")
+            return
+
+        chat_id = update.effective_chat.id
         custom = " ".join(context.args)
-        chat_id = chat.id
-        async with get_lock(chat_id):
+        lock = self.get_lock(chat_id)
+        async with lock:
             if chat_id in self.active_custom_nc:
-                await self.cancel_tasks(self.active_custom_nc[chat_id])
-            num = self.threads.get(chat_id, 1)
-            tasks = [asyncio.create_task(self.custom_nc_loop(chat_id, custom, context, i+1)) for i in range(num)]
-            self.active_custom_nc[chat_id] = tasks
-        await update.message.reply_text(f"[Bot #{self.bot_id}] Custom NC started!")
+                await update.message.reply_text("✅ Custom NC already running")
+                return
 
-    async def cmd_stop_ctmnc(self, update, context):
-        if not await self.check_auth(update):
-            return
-        chat_id = update.effective_chat.id
-        async with get_lock(chat_id):
-            if chat_id in self.active_custom_nc:
-                await self.cancel_tasks(self.active_custom_nc[chat_id])
-                del self.active_custom_nc[chat_id]
-                await update.message.reply_text(f"[Bot #{self.bot_id}] Custom NC stopped!")
-            else:
-                await update.message.reply_text("No active custom NC loop!")
+            self.active_custom_nc[chat_id] = []
+            task = asyncio.create_task(self.custom_nc_loop(chat_id, custom, context))
+            self.active_custom_nc[chat_id].append(task)
+            await update.message.reply_text(f"🚀 **Custom NC Started**: {custom}")
 
-    async def cmd_spam(self, update, context):
+    async def cmd_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
-            return
-        chat = update.effective_chat
-        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            await update.message.reply_text("Groups only!")
             return
         if not context.args:
-            await update.message.reply_text("Usage: /spam <target>")
+            await update.message.reply_text("Usage: /reply <target_name>")
             return
-        target = " ".join(context.args)
-        chat_id = chat.id
-        async with get_lock(chat_id):
-            if chat_id in self.active_spam:
-                await self.cancel_tasks(self.active_spam[chat_id])
-            num = self.threads.get(chat_id, 1)
-            tasks = [asyncio.create_task(self.spam_loop(chat_id, target, context, i+1)) for i in range(num)]
-            self.active_spam[chat_id] = tasks
-        await update.message.reply_text(f"[Bot #{self.bot_id}] Spam started with {num} threads!")
 
-    async def cmd_stop_spam(self, update, context):
-        if not await self.check_auth(update):
-            return
         chat_id = update.effective_chat.id
-        async with get_lock(chat_id):
-            if chat_id in self.active_spam:
-                await self.cancel_tasks(self.active_spam[chat_id])
-                del self.active_spam[chat_id]
-                await update.message.reply_text(f"[Bot #{self.bot_id}] Spam stopped!")
-            else:
-                await update.message.reply_text("No active spam loop!")
-
-    async def cmd_reply(self, update, context):
-        if not await self.check_auth(update):
-            return
-        chat = update.effective_chat
-        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            await update.message.reply_text("Groups only!")
-            return
-        if not context.args:
-            await update.message.reply_text("Usage: /reply <target>")
-            return
         target = " ".join(context.args)
-        chat_id = chat.id
-        async with get_lock(chat_id):
+        lock = self.get_lock(chat_id)
+        async with lock:
             if chat_id in self.active_reply:
-                self.active_reply[chat_id].cancel()
+                await update.message.reply_text("✅ Reply already active in this chat")
+                return
+
             self.reply_targets[chat_id] = target
-            self.pending_replies[chat_id] = []
-            task = asyncio.create_task(self.reply_loop(chat_id, target, context))
+            task = asyncio.create_task(self.reply_loop(chat_id, context))
             self.active_reply[chat_id] = task
-        await update.message.reply_text(f"[Bot #{self.bot_id}] Reply started for {target}!")
+            await update.message.reply_text(f"🚀 **Reply Mode Active** for {target}")
 
-    async def cmd_stop_reply(self, update, context):
+    async def cmd_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
-            return
-        chat_id = update.effective_chat.id
-        async with get_lock(chat_id):
-            if chat_id in self.active_reply:
-                self.active_reply[chat_id].cancel()
-                del self.active_reply[chat_id]
-                self.reply_targets.pop(chat_id, None)
-                self.pending_replies.pop(chat_id, None)
-                await update.message.reply_text(f"[Bot #{self.bot_id}] Reply stopped!")
-            else:
-                await update.message.reply_text("No active reply loop!")
-
-    async def cmd_target(self, update, context):
-        if not await self.check_auth(update):
-            return
-        chat = update.effective_chat
-        if chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
-            await update.message.reply_text("Groups only!")
             return
         if not context.args:
-            await update.message.reply_text("Usage: /target <name>")
+            await update.message.reply_text("Usage: /target <target_name>")
             return
-        target = " ".join(context.args)
-        chat_id = chat.id
-        async with get_lock(chat_id):
-            if chat_id in self.active_nc:
-                await self.cancel_tasks(self.active_nc[chat_id])
-            if chat_id in self.active_spam:
-                await self.cancel_tasks(self.active_spam[chat_id])
-            num = self.threads.get(chat_id, 1)
-            nc_tasks = [asyncio.create_task(self.nc_loop(chat_id, target, context, i+1)) for i in range(num)]
-            spam_tasks = [asyncio.create_task(self.spam_loop(chat_id, target, context, i+1)) for i in range(num)]
-            self.active_nc[chat_id] = nc_tasks
-            self.active_spam[chat_id] = spam_tasks
-        await update.message.reply_text(f"[Bot #{self.bot_id}] TARGET mode: NC + SPAM started!")
 
-    async def cmd_delay(self, update, context):
+        chat_id = update.effective_chat.id
+        target = " ".join(context.args)
+        await self.cmd_nc(update, context)
+        await self.cmd_spam(update, context)
+        await update.message.reply_text(f"🚀 **NC + Spam Started** for {target}")
+
+    async def cmd_delay(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
             return
         if not context.args:
             await update.message.reply_text("Usage: /delay <seconds>")
             return
+
         try:
             delay = float(context.args[0])
-            self.delays[update.effective_chat.id] = delay
-            await update.message.reply_text(f"Delay set to {delay}s!")
+            chat_id = update.effective_chat.id
+            self.delays[chat_id] = delay
+            await update.message.reply_text(f"⏱ Delay set to {delay}s")
         except ValueError:
-            await update.message.reply_text("Invalid delay!")
+            await update.message.reply_text("Invalid delay value!")
 
-    async def cmd_threads(self, update, context):
+    async def cmd_threads(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
             return
         if not context.args:
             await update.message.reply_text("Usage: /threads <1-50>")
             return
+
         try:
-            num = int(context.args[0])
-            if num < 1 or num > 50:
-                await update.message.reply_text("Threads: 1-50!")
+            threads = int(context.args[0])
+            if threads < 1 or threads > 50:
+                await update.message.reply_text("Threads must be between 1 and 50!")
                 return
-            self.threads[update.effective_chat.id] = num
-            await update.message.reply_text(f"Threads set to {num}!")
+            chat_id = update.effective_chat.id
+            self.threads[chat_id] = threads
+            await update.message.reply_text(f"🔄 Threads set to {threads}")
         except ValueError:
-            await update.message.reply_text("Invalid threads!")
+            await update.message.reply_text("Invalid thread count!")
 
-    async def cmd_stopall(self, update, context):
+    async def cmd_stopall(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
             return
-        count = await self.stop_all()
-        await update.message.reply_text(f"[Bot #{self.bot_id}] Stopped {count} tasks!")
 
-    async def cmd_ping(self, update, context):
+        chat_id = update.effective_chat.id
+        stopped = 0
+
+        if chat_id in self.active_spam:
+            await self.cancel_tasks(self.active_spam[chat_id])
+            del self.active_spam[chat_id]
+            stopped += 1
+
+        if chat_id in self.active_nc:
+            await self.cancel_tasks(self.active_nc[chat_id])
+            del self.active_nc[chat_id]
+            stopped += 1
+
+        if chat_id in self.active_custom_nc:
+            await self.cancel_tasks(self.active_custom_nc[chat_id])
+            del self.active_custom_nc[chat_id]
+            stopped += 1
+
+        if chat_id in self.active_reply:
+            self.active_reply[chat_id].cancel()
+            del self.active_reply[chat_id]
+            stopped += 1
+
+        await update.message.reply_text(f"⏹ Stopped {stopped} operation(s)")
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self.check_auth(update):
             return
-        start = time.time()
-        msg = await update.message.reply_text("🏓...")
-        await msg.edit_text(f"🏓 {(time.time()-start)*1000:.2f}ms")
 
-    async def cmd_status(self, update, context):
-        if not await self.check_auth(update):
-            return
-        up = time.time() - self.stats["start"]
-        h, r = divmod(int(up), 3600)
-        m, s = divmod(r, 60)
-        await update.message.reply_text(f"""
-📊 Bot #{self.bot_id} Stats:
-✅ Sent: {self.stats['sent']}
+        uptime = time.time() - self.stats["start"]
+        uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m"
+        text = f"""
+📊 **Bot Stats**
+
+📤 Sent: {self.stats['sent']}
 ❌ Errors: {self.stats['errors']}
-⏱ Uptime: {h}h {m}m {s}s
-🧵 Active: NC={len(self.active_nc)} Spam={len(self.active_spam)} Reply={len(self.active_reply)}
-""")
+⏱ Uptime: {uptime_str}
+"""
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-    def build(self) -> Application:
-        app = Application.builder().token(self.token).build()
-        app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("help", self.cmd_start))
-        app.add_handler(CommandHandler("nc", self.cmd_nc))
-        app.add_handler(CommandHandler("stopnc", self.cmd_stop_nc))
-        app.add_handler(CommandHandler("ctmnc", self.cmd_ctmnc))
-        app.add_handler(CommandHandler("stopctmnc", self.cmd_stop_ctmnc))
-        app.add_handler(CommandHandler("spam", self.cmd_spam))
-        app.add_handler(CommandHandler("stopspam", self.cmd_stop_spam))
-        app.add_handler(CommandHandler("reply", self.cmd_reply))
-        app.add_handler(CommandHandler("stopreply", self.cmd_stop_reply))
-        app.add_handler(CommandHandler("target", self.cmd_target))
-        app.add_handler(CommandHandler("delay", self.cmd_delay))
-        app.add_handler(CommandHandler("threads", self.cmd_threads))
-        app.add_handler(CommandHandler("stopall", self.cmd_stopall))
-        app.add_handler(CommandHandler("ping", self.cmd_ping))
-        app.add_handler(CommandHandler("status", self.cmd_status))
-        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.msg_collector))
-        return app
+    async def cmd_adduser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /adduser <bot_id> <user_id>")
+            return
 
-    async def run(self):
         try:
-            self.app = self.build()
-            logger.info(f"[ChildBot {self.bot_id}] Starting...")
-            await self.app.initialize()
-            await self.app.start()
-            await self.app.updater.start_polling(drop_pending_updates=True)
-            Database.update_bot_status(self.bot_id, True)
-            logger.info(f"[ChildBot {self.bot_id}] Running!")
+            bot_id = int(context.args[0])
+            user_id = int(context.args[1])
+            if Database.add_bot_user(bot_id, user_id, update.effective_user.id):
+                await update.message.reply_text(f"✅ User {user_id} added to bot {bot_id}")
+            else:
+                await update.message.reply_text("User already added or bot not found!")
+        except ValueError:
+            await update.message.reply_text("Invalid IDs!")
 
-            while not self.stop_event.is_set():
-                await asyncio.sleep(1)
+    async def cmd_removeuser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: /removeuser <bot_id> <user_id>")
+            return
 
-            logger.info(f"[ChildBot {self.bot_id}] Stopping...")
-            self.running = False
-            await self.stop_all()
-            await self.app.updater.stop()
-            await self.app.stop()
-            await self.app.shutdown()
-            Database.update_bot_status(self.bot_id, False)
-        except Exception as e:
-            logger.error(f"[ChildBot {self.bot_id}] Error: {e}")
-            Database.update_bot_status(self.bot_id, False)
+        try:
+            bot_id = int(context.args[0])
+            user_id = int(context.args[1])
+            if Database.remove_bot_user(bot_id, user_id):
+                await update.message.reply_text(f"✅ User {user_id} removed from bot {bot_id}")
+            else:
+                await update.message.reply_text("User not found!")
+        except ValueError:
+            await update.message.reply_text("Invalid IDs!")
+
+    async def cmd_addnc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /addnc <template_text>")
+            return
+
+        template = " ".join(context.args)
+        bot = Database.get_bot(self.bot_id)
+        tpl_id = Database.add_nc_template(bot['user_id'], template)
+        await update.message.reply_text(f"✅ NC Template #{tpl_id} added!")
+
+    async def cmd_removenc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /removenc <id or 'all'>")
+            return
+
+        bot = Database.get_bot(self.bot_id)
+        if context.args[0].lower() == 'all':
+            count = Database.remove_nc_template(bot['user_id'])
+            await update.message.reply_text(f"✅ Removed {count} NC templates!")
+        else:
+            try:
+                tpl_id = int(context.args[0])
+                count = Database.remove_nc_template(bot['user_id'], tpl_id)
+                await update.message.reply_text(f"✅ Removed NC template #{tpl_id}!" if count > 0 else "Template not found!")
+            except ValueError:
+                await update.message.reply_text("Invalid template ID!")
+
+    async def cmd_addspam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /addspam <template_text>")
+            return
+
+        template = " ".join(context.args)
+        bot = Database.get_bot(self.bot_id)
+        tpl_id = Database.add_spam_template(bot['user_id'], template)
+        await update.message.reply_text(f"✅ Spam Template #{tpl_id} added!")
+
+    async def cmd_removespam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /removespam <id or 'all'>")
+            return
+
+        bot = Database.get_bot(self.bot_id)
+        if context.args[0].lower() == 'all':
+            count = Database.remove_spam_template(bot['user_id'])
+            await update.message.reply_text(f"✅ Removed {count} spam templates!")
+        else:
+            try:
+                tpl_id = int(context.args[0])
+                count = Database.remove_spam_template(bot['user_id'], tpl_id)
+                await update.message.reply_text(f"✅ Removed spam template #{tpl_id}!" if count > 0 else "Template not found!")
+            except ValueError:
+                await update.message.reply_text("Invalid template ID!")
+
+    async def cmd_addreply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /addreply <template_text>")
+            return
+
+        template = " ".join(context.args)
+        bot = Database.get_bot(self.bot_id)
+        tpl_id = Database.add_reply_template(bot['user_id'], template)
+        await update.message.reply_text(f"✅ Reply Template #{tpl_id} added!")
+
+    async def cmd_removereply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self.check_auth(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /removereply <id or 'all'>")
+            return
+
+        bot = Database.get_bot(self.bot_id)
+        if context.args[0].lower() == 'all':
+            count = Database.remove_reply_template(bot['user_id'])
+            await update.message.reply_text(f"✅ Removed {count} reply templates!")
+        else:
+            try:
+                tpl_id = int(context.args[0])
+                count = Database.remove_reply_template(bot['user_id'], tpl_id)
+                await update.message.reply_text(f"✅ Removed reply template #{tpl_id}!" if count > 0 else "Template not found!")
+            except ValueError:
+                await update.message.reply_text("Invalid template ID!")
 
 
 RUNNING_BOTS: Dict[int, ChildBot] = {}
@@ -971,7 +969,7 @@ RUNNING_BOTS: Dict[int, ChildBot] = {}
 
 class ControllerBot:
     def __init__(self):
-        self.user_data: Dict[int, dict] = {}
+        self.app = None
 
     def get_main_menu(self):
         keyboard = [
@@ -1099,17 +1097,39 @@ Use the buttons below to manage your bots:
                 await query.edit_message_text("❌ Bot not found!")
                 return
             if bot_id in RUNNING_BOTS:
-                await query.answer("Bot is already running!", show_alert=True)
+                await query.answer("⚠️ Bot is already running!", show_alert=True)
                 return
-            child = ChildBot(bot_id, bot['token'], bot['user_id'])
-            RUNNING_BOTS[bot_id] = child
-            asyncio.create_task(child.run())
-            await query.answer(f"✅ Bot #{bot_id} started!", show_alert=True)
+            
+            await query.answer()
             await query.edit_message_text(
-                f"✅ **Bot #{bot_id} Started!**\n\n@{bot['bot_username']} is now running.",
+                f"⏳ **Starting Bot #{bot_id}...**\n\n@{bot['bot_username']}\n\n_Please wait while we initialize the bot..._",
                 reply_markup=self.get_bot_actions(bot_id),
                 parse_mode=ParseMode.MARKDOWN
             )
+            
+            try:
+                child = ChildBot(bot_id, bot['token'], bot['user_id'])
+                RUNNING_BOTS[bot_id] = child
+                asyncio.create_task(child.run())
+                
+                await query.edit_message_text(
+                    f"✅ **Bot #{bot_id} Started Successfully!**\n\n"
+                    f"👤 Username: @{bot['bot_username']}\n"
+                    f"📛 Name: {bot['bot_name'] or 'N/A'}\n"
+                    f"🟢 Status: Running\n\n"
+                    f"_The bot is now active and listening for commands._",
+                    reply_markup=self.get_bot_actions(bot_id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.info(f"Bot #{bot_id} started successfully")
+            except Exception as e:
+                await query.edit_message_text(
+                    f"❌ **Failed to Start Bot #{bot_id}**\n\n"
+                    f"Error: {str(e)}",
+                    reply_markup=self.get_bot_actions(bot_id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.error(f"Failed to start bot {bot_id}: {e}")
 
         elif data.startswith("bot_stop_"):
             bot_id = int(data.split("_")[2])
@@ -1118,16 +1138,39 @@ Use the buttons below to manage your bots:
                 await query.edit_message_text("❌ Bot not found!")
                 return
             if bot_id not in RUNNING_BOTS:
-                await query.answer("Bot is not running!", show_alert=True)
+                await query.answer("⚠️ Bot is not running!", show_alert=True)
                 return
-            RUNNING_BOTS[bot_id].stop_event.set()
-            del RUNNING_BOTS[bot_id]
-            await query.answer(f"✅ Bot #{bot_id} stopped!", show_alert=True)
+            
+            await query.answer()
             await query.edit_message_text(
-                f"⏹ **Bot #{bot_id} Stopped!**\n\n@{bot['bot_username']} is now offline.",
+                f"⏳ **Stopping Bot #{bot_id}...**\n\n@{bot['bot_username']}\n\n_Please wait while we shut down the bot..._",
                 reply_markup=self.get_bot_actions(bot_id),
                 parse_mode=ParseMode.MARKDOWN
             )
+            
+            try:
+                if bot_id in RUNNING_BOTS:
+                    RUNNING_BOTS[bot_id].stop_event.set()
+                    del RUNNING_BOTS[bot_id]
+                
+                await query.edit_message_text(
+                    f"⏹ **Bot #{bot_id} Stopped Successfully!**\n\n"
+                    f"👤 Username: @{bot['bot_username']}\n"
+                    f"📛 Name: {bot['bot_name'] or 'N/A'}\n"
+                    f"🔴 Status: Offline\n\n"
+                    f"_The bot is now stopped. Click Start to activate it again._",
+                    reply_markup=self.get_bot_actions(bot_id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.info(f"Bot #{bot_id} stopped successfully")
+            except Exception as e:
+                await query.edit_message_text(
+                    f"❌ **Failed to Stop Bot #{bot_id}**\n\n"
+                    f"Error: {str(e)}",
+                    reply_markup=self.get_bot_actions(bot_id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.error(f"Failed to stop bot {bot_id}: {e}")
 
         elif data.startswith("bot_info_"):
             bot_id = int(data.split("_")[2])
@@ -1406,7 +1449,15 @@ Use `{target}` as placeholder
 
     async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Operation cancelled.")
+        context.user_data.clear()
         return ConversationHandler.END
+
+    async def text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if 'adding_bot' in context.user_data:
+            if context.user_data.get('bot_step') == 'token':
+                return await self.receive_token(update, context)
+            elif context.user_data.get('bot_step') == 'owner_id':
+                return await self.receive_owner_id(update, context)
 
     async def cmd_removebot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -1484,10 +1535,9 @@ Use `{target}` as placeholder
                 await update.message.reply_text("⚠️ Bot is already running!")
                 return
 
-            child = ChildBot(bot_id, bot['token'], user_id)
+            child = ChildBot(bot_id, bot['token'], bot['user_id'])
             RUNNING_BOTS[bot_id] = child
             asyncio.create_task(child.run())
-
             await update.message.reply_text(f"✅ Bot #{bot_id} started!")
         except ValueError:
             await update.message.reply_text("Invalid bot ID!")
@@ -1515,321 +1565,46 @@ Use `{target}` as placeholder
         except ValueError:
             await update.message.reply_text("Invalid bot ID!")
 
-    async def cmd_startall(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        bots = Database.get_user_bots(user_id)
-        started = 0
-        for bot in bots:
-            if bot['id'] not in RUNNING_BOTS:
-                child = ChildBot(bot['id'], bot['token'], user_id)
-                RUNNING_BOTS[bot['id']] = child
-                asyncio.create_task(child.run())
-                started += 1
-        await update.message.reply_text(f"✅ Started {started} bots!")
-
-    async def cmd_stopall(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        bots = Database.get_user_bots(user_id)
-        stopped = 0
-        for bot in bots:
-            if bot['id'] in RUNNING_BOTS:
-                RUNNING_BOTS[bot['id']].stop_event.set()
-                del RUNNING_BOTS[bot['id']]
-                stopped += 1
-        await update.message.reply_text(f"✅ Stopped {stopped} bots!")
-
-    async def cmd_addnc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /addnc <template>\nUse {target} as placeholder.")
-            return
-        template = " ".join(context.args)
-        tid = Database.add_nc_template(user_id, template)
-        await update.message.reply_text(f"✅ NC template #{tid} added!")
-
-    async def cmd_listnc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        templates = Database.get_nc_templates(user_id)
-        if not templates:
-            await update.message.reply_text("📭 No NC templates. Default ones will be used.")
-            return
-        text = "📝 **Your NC Templates:**\n\n"
-        for t in templates:
-            text += f"**#{t['id']}:** {t['template'][:50]}...\n"
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    async def cmd_removenc(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /removenc <id/all>")
-            return
-        arg = context.args[0].lower()
-        if arg == "all":
-            count = Database.remove_nc_template(user_id)
-            await update.message.reply_text(f"✅ Removed {count} NC templates!")
-        else:
-            try:
-                tid = int(arg)
-                if Database.remove_nc_template(user_id, tid):
-                    await update.message.reply_text(f"✅ NC template #{tid} removed!")
-                else:
-                    await update.message.reply_text("❌ Template not found!")
-            except ValueError:
-                await update.message.reply_text("Invalid ID!")
-
-    async def cmd_addspam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /addspam <template>\nUse {target} as placeholder.")
-            return
-        template = " ".join(context.args)
-        tid = Database.add_spam_template(user_id, template)
-        await update.message.reply_text(f"✅ Spam template #{tid} added!")
-
-    async def cmd_listspam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        templates = Database.get_spam_templates(user_id)
-        if not templates:
-            await update.message.reply_text("📭 No spam templates. Default ones will be used.")
-            return
-        text = "📝 **Your Spam Templates:**\n\n"
-        for t in templates:
-            text += f"**#{t['id']}:** {t['template'][:50]}...\n"
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    async def cmd_removespam(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /removespam <id/all>")
-            return
-        arg = context.args[0].lower()
-        if arg == "all":
-            count = Database.remove_spam_template(user_id)
-            await update.message.reply_text(f"✅ Removed {count} spam templates!")
-        else:
-            try:
-                tid = int(arg)
-                if Database.remove_spam_template(user_id, tid):
-                    await update.message.reply_text(f"✅ Spam template #{tid} removed!")
-                else:
-                    await update.message.reply_text("❌ Template not found!")
-            except ValueError:
-                await update.message.reply_text("Invalid ID!")
-
-    async def cmd_addreply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /addreply <template>\nUse {target} as placeholder.")
-            return
-        template = " ".join(context.args)
-        tid = Database.add_reply_template(user_id, template)
-        await update.message.reply_text(f"✅ Reply template #{tid} added!")
-
-    async def cmd_listreply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        templates = Database.get_reply_templates(user_id)
-        if not templates:
-            await update.message.reply_text("📭 No reply templates. Default ones will be used.")
-            return
-        text = "💬 **Your Reply Templates:**\n\n"
-        for t in templates:
-            text += f"**#{t['id']}:** {t['template'][:50]}...\n"
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    async def cmd_removereply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /removereply <id/all>")
-            return
-        arg = context.args[0].lower()
-        if arg == "all":
-            count = Database.remove_reply_template(user_id)
-            await update.message.reply_text(f"✅ Removed {count} reply templates!")
-        else:
-            try:
-                tid = int(arg)
-                if Database.remove_reply_template(user_id, tid):
-                    await update.message.reply_text(f"✅ Reply template #{tid} removed!")
-                else:
-                    await update.message.reply_text("❌ Template not found!")
-            except ValueError:
-                await update.message.reply_text("Invalid ID!")
-
-    async def cmd_adduser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if len(context.args) < 2:
-            await update.message.reply_text("Usage: /adduser <bot_id> <user_id>")
-            return
-        try:
-            bot_id = int(context.args[0])
-            target_id = int(context.args[1])
-            bot = Database.get_bot(bot_id)
-            if not bot or bot['user_id'] != user_id:
-                await update.message.reply_text("❌ Bot not found or not yours!")
-                return
-            if Database.add_bot_user(bot_id, target_id, user_id):
-                await update.message.reply_text(f"✅ User {target_id} authorized for Bot #{bot_id}!")
-            else:
-                await update.message.reply_text("⚠️ User already authorized!")
-        except ValueError:
-            await update.message.reply_text("Invalid IDs!")
-
-    async def cmd_removeuser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if len(context.args) < 2:
-            await update.message.reply_text("Usage: /removeuser <bot_id> <user_id>")
-            return
-        try:
-            bot_id = int(context.args[0])
-            target_id = int(context.args[1])
-            bot = Database.get_bot(bot_id)
-            if not bot or bot['user_id'] != user_id:
-                await update.message.reply_text("❌ Bot not found or not yours!")
-                return
-            if Database.remove_bot_user(bot_id, target_id):
-                await update.message.reply_text(f"✅ User {target_id} removed from Bot #{bot_id}!")
-            else:
-                await update.message.reply_text("❌ User not found!")
-        except ValueError:
-            await update.message.reply_text("Invalid IDs!")
-
-    async def cmd_listusers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not context.args:
-            await update.message.reply_text("Usage: /listusers <bot_id>")
-            return
-        try:
-            bot_id = int(context.args[0])
-            bot = Database.get_bot(bot_id)
-            if not bot or bot['user_id'] != user_id:
-                await update.message.reply_text("❌ Bot not found or not yours!")
-                return
-            users = Database.get_bot_users(bot_id)
-            if not users:
-                await update.message.reply_text(f"📭 No authorized users for Bot #{bot_id}")
-                return
-            text = f"👥 **Authorized Users for Bot #{bot_id}:**\n\n"
-            for u in users:
-                text += f"• `{u}`\n"
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-        except ValueError:
-            await update.message.reply_text("Invalid bot ID!")
-
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        bots = Database.get_user_bots(user_id)
-        running = sum(1 for b in bots if b['id'] in RUNNING_BOTS)
-
-        text = f"""
-📊 **Controller Status**
-
-👤 Your ID: `{user_id}`
-🤖 Your Bots: {len(bots)}
-🟢 Running: {running}
-🔴 Stopped: {len(bots) - running}
-
-📝 NC Templates: {len(Database.get_nc_templates(user_id))}
-📝 Spam Templates: {len(Database.get_spam_templates(user_id))}
-💬 Reply Templates: {len(Database.get_reply_templates(user_id))}
-"""
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-    async def handle_bot_flow_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not context.user_data.get('adding_bot'):
-            return
-        
-        if context.user_data.get('bot_step') == 'token':
-            await self.receive_token(update, context)
-            if context.user_data.get('bot_step') == 'owner_id':
-                pass
-        elif context.user_data.get('bot_step') == 'owner_id':
-            await self.receive_owner_id(update, context)
-            context.user_data.pop('adding_bot', None)
-            context.user_data.pop('bot_step', None)
-
-    def build(self) -> Application:
-        app = Application.builder().token(CONTROLLER_TOKEN).build()
+    async def run(self):
+        self.app = Application.builder().token(CONTROLLER_TOKEN).build()
 
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("addbot", self.cmd_addbot)],
             states={
                 WAITING_TOKEN: [
-                    CommandHandler("cancel", self.cmd_cancel),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_token)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_token),
                 ],
                 WAITING_OWNER_ID: [
-                    CommandHandler("cancel", self.cmd_cancel),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_owner_id)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_owner_id),
                 ],
             },
             fallbacks=[CommandHandler("cancel", self.cmd_cancel)],
+            persistent=False,
+            name="add_bot_conv"
         )
+        self.app.add_handler(conv_handler)
+        
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_handler))
+        self.app.add_handler(CommandHandler("start", self.cmd_start))
+        self.app.add_handler(CommandHandler("removebot", self.cmd_removebot))
+        self.app.add_handler(CommandHandler("listbots", self.cmd_listbots))
+        self.app.add_handler(CommandHandler("botinfo", self.cmd_botinfo))
+        self.app.add_handler(CommandHandler("startbot", self.cmd_startbot))
+        self.app.add_handler(CommandHandler("stopbot", self.cmd_stopbot))
+        self.app.add_handler(CallbackQueryHandler(self.callback_handler))
 
-        app.add_handler(conv_handler)
-        app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("help", self.cmd_start))
-        app.add_handler(CallbackQueryHandler(self.callback_handler))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_bot_flow_message))
-        app.add_handler(CommandHandler("removebot", self.cmd_removebot))
-        app.add_handler(CommandHandler("listbots", self.cmd_listbots))
-        app.add_handler(CommandHandler("botinfo", self.cmd_botinfo))
-        app.add_handler(CommandHandler("startbot", self.cmd_startbot))
-        app.add_handler(CommandHandler("stopbot", self.cmd_stopbot))
-        app.add_handler(CommandHandler("startall", self.cmd_startall))
-        app.add_handler(CommandHandler("stopall", self.cmd_stopall))
-        app.add_handler(CommandHandler("addnc", self.cmd_addnc))
-        app.add_handler(CommandHandler("listnc", self.cmd_listnc))
-        app.add_handler(CommandHandler("removenc", self.cmd_removenc))
-        app.add_handler(CommandHandler("addspam", self.cmd_addspam))
-        app.add_handler(CommandHandler("listspam", self.cmd_listspam))
-        app.add_handler(CommandHandler("removespam", self.cmd_removespam))
-        app.add_handler(CommandHandler("addreply", self.cmd_addreply))
-        app.add_handler(CommandHandler("listreply", self.cmd_listreply))
-        app.add_handler(CommandHandler("removereply", self.cmd_removereply))
-        app.add_handler(CommandHandler("adduser", self.cmd_adduser))
-        app.add_handler(CommandHandler("removeuser", self.cmd_removeuser))
-        app.add_handler(CommandHandler("listusers", self.cmd_listusers))
-        app.add_handler(CommandHandler("status", self.cmd_status))
-
-        return app
+        await self.app.initialize()
+        await self.app.start()
+        logger.info("Controller bot started!")
+        await self.app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("Polling started!")
+        await asyncio.Event().wait()
 
 
 async def main():
-    print("=" * 60)
-    print("⚡ HYPER-X Multi-Bot Controller v3.0 ⚡")
-    print("=" * 60)
-
-    if not CONTROLLER_TOKEN:
-        print("❌ ERROR: Set CONTROLLER_BOT_TOKEN environment variable!")
-        return
-
-    if not DATABASE_URL:
-        print("❌ ERROR: Set DATABASE_URL environment variable!")
-        return
-
     init_database()
-
     controller = ControllerBot()
-    app = controller.build()
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    print("✅ Controller Bot is running!")
-    print("🌐 Open for everyone - no restrictions!")
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        for bot_id, bot in list(RUNNING_BOTS.items()):
-            bot.stop_event.set()
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    await controller.run()
 
 
 if __name__ == "__main__":
